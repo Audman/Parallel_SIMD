@@ -1,66 +1,70 @@
-#define _GNU_SOURCE
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <stdint.h>
 #include <time.h>
 #include <pthread.h>
-#include <emmintrin.h>   /* SSE2 */
+#include <emmintrin.h>
 
-#define BUF_SIZE_MB 256
-#define BUF_SIZE    ((size_t)(BUF_SIZE_MB) * 1024 * 1024)
-#define NUM_THREADS 4
+#define SIZE_MB  256
+#define THREADS  4
+#define MB       (1024ULL * 1024ULL)
 
-static double elapsed_sec(struct timespec a, struct timespec b) {
-    return (b.tv_sec - a.tv_sec) + (b.tv_nsec - a.tv_nsec) * 1e-9;
+static double now_sec(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return ts.tv_sec + ts.tv_nsec * 1e-9;
 }
 
-static void fill_buffer(char *buf, size_t n) {
+static void fill_buffer(char *buf, size_t n)
+{
     static const char charset[] =
         "abcdefghijklmnopqrstuvwxyz"
         "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
         "0123456789 !.,;:?-_()[]{}";
-
     int len = sizeof(charset) - 1;
-
-    srandom(42);
+    srand(42);
     for (size_t i = 0; i < n; i++)
-        buf[i] = charset[random() % len];
+        buf[i] = charset[rand() % len];
 }
 
 typedef struct {
     char  *buf;
-    size_t start, end;
-} ChunkArgs;
+    size_t start;
+    size_t end;
+} thread_arg;
 
 static void *mt_worker(void *arg)
 {
-    ChunkArgs *a = (ChunkArgs *)arg;
-    for (size_t i = a->start; i < a->end; i++)
+    thread_arg *th = (thread_arg *)arg;
+    for (size_t i = th->start; i < th->end; i++)
     {
-        if (a->buf[i] >= 'a' && a->buf[i] <= 'z')
-            a->buf[i] -= 32;
+        if (th->buf[i] >= 'a' && th->buf[i] <= 'z')
+            th->buf[i] -= 32;
     }
     return NULL;
 }
 
-static void mt_toupper(char *buf, size_t n, int nthreads)
+static void toupper_mt(char *buf, size_t n, int nthreads)
 {
-    pthread_t threads[nthreads];
-    ChunkArgs args[nthreads];
+    pthread_t  threads[nthreads];
+    thread_arg args[nthreads];
     size_t chunk = n / nthreads;
-    for (int t = 0; t < nthreads; t++)
+
+    for (int i = 0; i < nthreads; i++)
     {
-        args[t].buf   = buf;
-        args[t].start = (size_t)t * chunk;
-        args[t].end   = (t == nthreads - 1) ? n : args[t].start + chunk;
-        pthread_create(&threads[t], NULL, mt_worker, &args[t]);
+        args[i].buf   = buf;
+        args[i].start = (size_t)i * chunk;
+        args[i].end   = (i == nthreads - 1) ? n : args[i].start + chunk;
+        pthread_create(&threads[i], NULL, mt_worker, &args[i]);
     }
-    for (int t = 0; t < nthreads; t++)
-        pthread_join(threads[t], NULL);
+
+    for (int i = 0; i < nthreads; i++)
+        pthread_join(threads[i], NULL);
 }
 
-static void simd_toupper(char *buf, size_t n)
+static void toupper_simd(char *buf, size_t n)
 {
     const __m128i low_a  = _mm_set1_epi8('a' - 1);
     const __m128i thresh = _mm_set1_epi8(127);
@@ -89,78 +93,73 @@ static void simd_toupper(char *buf, size_t n)
     }
 }
 
-typedef struct {
-    char  *buf;
-    size_t start, end;
-} SimdChunkArgs;
-
 static void *simd_mt_worker(void *arg)
 {
-    SimdChunkArgs *a = (SimdChunkArgs *)arg;
-    simd_toupper(a->buf + a->start, a->end - a->start);
+    thread_arg *th = (thread_arg *)arg;
+    toupper_simd(th->buf + th->start, th->end - th->start);
     return NULL;
 }
 
-static void simd_mt_toupper(char *buf, size_t n, int nthreads)
+static void toupper_simd_mt(char *buf, size_t n, int nthreads)
 {
-    pthread_t     threads[nthreads];
-    SimdChunkArgs args[nthreads];
+    pthread_t  threads[nthreads];
+    thread_arg args[nthreads];
     size_t chunk = n / nthreads;
-    for (int t = 0; t < nthreads; t++)
+
+    for (int i = 0; i < nthreads; i++)
     {
-        args[t].buf   = buf;
-        args[t].start = (size_t)t * chunk;
-        args[t].end   = (t == nthreads - 1) ? n : args[t].start + chunk;
-        pthread_create(&threads[t], NULL, simd_mt_worker, &args[t]);
+        args[i].buf   = buf;
+        args[i].start = (size_t)i * chunk;
+        args[i].end   = (i == nthreads - 1) ? n : args[i].start + chunk;
+        pthread_create(&threads[i], NULL, simd_mt_worker, &args[i]);
     }
 
-    for (int t = 0; t < nthreads; t++)
-        pthread_join(threads[t], NULL);
+    for (int i = 0; i < nthreads; i++)
+        pthread_join(threads[i], NULL);
 }
 
 int main(void)
 {
-    char *src         = malloc(BUF_SIZE);
-    char *buf_mt      = malloc(BUF_SIZE);
-    char *buf_simd    = malloc(BUF_SIZE);
-    char *buf_simd_mt = malloc(BUF_SIZE);
+    size_t n = (size_t)SIZE_MB * MB;
 
-    if (!src || !buf_mt || !buf_simd || !buf_simd_mt) {
+    char *src         = malloc(n);
+    char *buf_mt      = malloc(n);
+    char *buf_simd    = malloc(n);
+    char *buf_simd_mt = malloc(n);
+
+    if (!src || !buf_mt || !buf_simd || !buf_simd_mt)
+    {
         perror("malloc");
         return 1;
     }
 
-    fill_buffer(src, BUF_SIZE);
+    fill_buffer(src, n);
+    memcpy(buf_mt,      src, n);
+    memcpy(buf_simd,    src, n);
+    memcpy(buf_simd_mt, src, n);
 
-    memcpy(buf_mt,      src, BUF_SIZE);
-    memcpy(buf_simd,    src, BUF_SIZE);
-    memcpy(buf_simd_mt, src, BUF_SIZE);
+    printf("Buffer size:  %d MB\n", SIZE_MB);
+    printf("Threads used: %d\n\n", THREADS);
 
-    printf("Buffer size:  %d MB\n", BUF_SIZE_MB);
-    printf("Threads used: %d\n\n", NUM_THREADS);
+    double t0, t1;
 
-    struct timespec t0, t1;
+    t0 = now_sec();
+    toupper_mt(buf_mt, n, THREADS);
+    t1 = now_sec();
 
-    clock_gettime(CLOCK_MONOTONIC, &t0);
-    mt_toupper(buf_mt, BUF_SIZE, NUM_THREADS);
-    clock_gettime(CLOCK_MONOTONIC, &t1);
+    printf("MT time:        %.3f sec\n", t1 - t0);
 
-    double t_mt = elapsed_sec(t0, t1);
-    printf("MT time:        %.3f sec\n", t_mt);
+    t0 = now_sec();
+    toupper_simd(buf_simd, n);
+    t1 = now_sec();
 
-    clock_gettime(CLOCK_MONOTONIC, &t0);
-    simd_toupper(buf_simd, BUF_SIZE);
-    clock_gettime(CLOCK_MONOTONIC, &t1);
+    printf("SIMD time:      %.3f sec\n", t1 - t0);
 
-    double t_simd = elapsed_sec(t0, t1);
-    printf("SIMD time:      %.3f sec\n", t_simd);
+    t0 = now_sec();
+    toupper_simd_mt(buf_simd_mt, n, THREADS);
+    t1 = now_sec();
 
-    clock_gettime(CLOCK_MONOTONIC, &t0);
-    simd_mt_toupper(buf_simd_mt, BUF_SIZE, NUM_THREADS);
-    clock_gettime(CLOCK_MONOTONIC, &t1);
-
-    double t_simd_mt = elapsed_sec(t0, t1);
-    printf("SIMD + MT time: %.3f sec\n", t_simd_mt);
+    printf("SIMD + MT time: %.3f sec\n", t1 - t0);
 
     free(src);
     free(buf_mt);
