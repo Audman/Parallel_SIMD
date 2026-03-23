@@ -20,6 +20,7 @@ static double now_sec(void)
 static void generate_dna(char *buf, size_t n)
 {
     static const char nucleotides[4] = {'A', 'C', 'G', 'T'};
+    srand(42);
     for (size_t i = 0; i < n; i++)
         buf[i] = nucleotides[rand() % 4];
 }
@@ -28,60 +29,67 @@ typedef struct {
     const char *buf;
     size_t      start;
     size_t      end;
-} MT_Args;
+    long long   a, c, g, t;
+} thread_arg;
 
-static long long   mt_A, mt_C, mt_G, mt_T;
-static pthread_mutex_t mt_mutex = PTHREAD_MUTEX_INITIALIZER;
+static pthread_mutex_t mutex = PTHREAD_MUTEX_INITIALIZER;
 
 static void *mt_worker(void *arg)
 {
-    MT_Args *a = (MT_Args *)arg;
+    thread_arg *th = (thread_arg *)arg;
     long long la = 0, lc = 0, lg = 0, lt = 0;
-    for (size_t i = a->start; i < a->end; i++)
+
+    for (size_t i = th->start; i < th->end; i++)
     {
-        char ch = a->buf[i];
-        if      (ch == 'A') la++;
-        else if (ch == 'C') lc++;
-        else if (ch == 'G') lg++;
-        else if (ch == 'T') lt++;
+        switch (th->buf[i])
+        {
+            case 'A': la++; break;
+            case 'C': lc++; break;
+            case 'G': lg++; break;
+            case 'T': lt++; break;
+        }
     }
 
-    pthread_mutex_lock(&mt_mutex);
-    mt_A += la;
-    mt_C += lc;
-    mt_G += lg;
-    mt_T += lt;
-    pthread_mutex_unlock(&mt_mutex);
+    pthread_mutex_lock(&mutex);
+    th->a += la;
+    th->c += lc;
+    th->g += lg;
+    th->t += lt;
+    pthread_mutex_unlock(&mutex);
 
     return NULL;
 }
 
-static void count_multithreaded(const char *buf, size_t n, int nthreads, long long *a, long long *c, long long *g, long long *t)
+static void count_mt(const char *buf, size_t n, int nthreads, long long *ra, long long *rc, long long *rg, long long *rt)
 {
-    mt_A = mt_C = mt_G = mt_T = 0;
-
-    pthread_t  *threads = malloc(nthreads * sizeof(pthread_t));
-    MT_Args    *args    = malloc(nthreads * sizeof(MT_Args));
+    pthread_t  threads[nthreads];
+    thread_arg args[nthreads];
     size_t chunk = n / nthreads;
+
+    long long ga = 0, gc = 0, gg = 0, gt = 0;
 
     for (int i = 0; i < nthreads; i++)
     {
         args[i].buf   = buf;
         args[i].start = (size_t)i * chunk;
         args[i].end   = (i == nthreads - 1) ? n : args[i].start + chunk;
+        args[i].a = args[i].c = args[i].g = args[i].t = 0;
         pthread_create(&threads[i], NULL, mt_worker, &args[i]);
     }
 
     for (int i = 0; i < nthreads; i++)
+    {
         pthread_join(threads[i], NULL);
+        ga += args[i].a;
+        gc += args[i].c;
+        gg += args[i].g;
+        gt += args[i].t;
+    }
 
-    *a = mt_A;
-    *c = mt_C;
-    *g = mt_G;
-    *t = mt_T;
-
-    free(threads);
-    free(args);
+    *ra = ga;
+    *rc = gc;
+    *rg = gg;
+    *rt = gt;
 }
 
 static void count_simd(const char *buf, size_t n, long long *ra, long long *rc, long long *rg, long long *rt)
@@ -148,11 +156,13 @@ static void count_simd(const char *buf, size_t n, long long *ra, long long *rc, 
 
     for (; i < n; i++)
     {
-        char ch = buf[i];
-        if      (ch == 'A') la++;
-        else if (ch == 'C') lc++;
-        else if (ch == 'G') lg++;
-        else if (ch == 'T') lt++;
+        switch (buf[i])
+        {
+            case 'A': la++; break;
+            case 'C': lc++; break;
+            case 'G': lg++; break;
+            case 'T': lt++; break;
+        }
     }
 
     *ra = la;
@@ -161,24 +171,19 @@ static void count_simd(const char *buf, size_t n, long long *ra, long long *rc, 
     *rt = lt;
 }
 
-typedef struct {
-    const char *buf;
-    size_t      start;
-    size_t      end;
-    long long   a, c, g, t;
-} SIMD_MT_Args;
-
-static void *simd_mt_worker(void *arg) {
-    SIMD_MT_Args *a = (SIMD_MT_Args *)arg;
-    count_simd(a->buf + a->start, a->end - a->start,
-               &a->a, &a->c, &a->g, &a->t);
+/* ── SIMD + Multithreading ──────────────────────────────────────────────── */
+static void *simd_mt_worker(void *arg)
+{
+    thread_arg *th = (thread_arg *)arg;
+    count_simd(th->buf + th->start, th->end - th->start,
+               &th->a, &th->c, &th->g, &th->t);
     return NULL;
 }
 
 static void count_simd_mt(const char *buf, size_t n, int nthreads, long long *ra, long long *rc, long long *rg, long long *rt)
 {
-    pthread_t    *threads = malloc(nthreads * sizeof(pthread_t));
-    SIMD_MT_Args *args    = malloc(nthreads * sizeof(SIMD_MT_Args));
+    pthread_t  threads[nthreads];
+    thread_arg args[nthreads];
     size_t chunk = n / nthreads;
 
     for (int i = 0; i < nthreads; i++)
@@ -194,60 +199,56 @@ static void count_simd_mt(const char *buf, size_t n, int nthreads, long long *ra
     for (int i = 0; i < nthreads; i++)
     {
         pthread_join(threads[i], NULL);
-        ta += args[i].a;
-        tc += args[i].c;
-        tg += args[i].g;
-        tt += args[i].t;
+        ta += args[i].a; tc += args[i].c;
+        tg += args[i].g; tt += args[i].t;
     }
 
     *ra = ta;
     *rc = tc;
     *rg = tg;
     *rt = tt;
-
-    free(threads);
-    free(args);
 }
 
-
-int main()
+int main(void)
 {
-    int    size_mb  = SIZE_MB;
-    int    nthreads = THREADS;
-    size_t n        = (size_t)size_mb * MB;
+    size_t n = (size_t)SIZE_MB * MB;
 
-    printf("Allocating %d MB ...\n", size_mb);
+    printf("Allocating %d MB ...\n", SIZE_MB);
     char *buf = malloc(n);
     if (!buf) { perror("malloc"); return 1; }
 
     printf("Generating random DNA sequence ...\n");
     generate_dna(buf, n);
 
-    printf("\nDNA size:     %d MB  (%zu bytes)\n", size_mb, n);
-    printf("Threads used: %d\n\n", nthreads);
+    printf("\nDNA size:     %d MB  (%zu bytes)\n", SIZE_MB, n);
+    printf("Threads used: %d\n\n", THREADS);
 
     long long a, c, g, t;
     double t0, t1;
 
     t0 = now_sec();
-    count_multithreaded(buf, n, 1, &a, &c, &g, &t);
+    count_mt(buf, n, 1, &a, &c, &g, &t);
     t1 = now_sec();
+
     printf("Counts (A C G T):\n%lld %lld %lld %lld\n\n", a, c, g, t);
     printf("Scalar time:    %.3f sec\n", t1 - t0);
 
     t0 = now_sec();
-    count_multithreaded(buf, n, nthreads, &a, &c, &g, &t);
+    count_mt(buf, n, THREADS, &a, &c, &g, &t);
     t1 = now_sec();
+
     printf("MT time:        %.3f sec\n", t1 - t0);
 
     t0 = now_sec();
     count_simd(buf, n, &a, &c, &g, &t);
     t1 = now_sec();
+
     printf("SIMD time:      %.3f sec\n", t1 - t0);
 
     t0 = now_sec();
-    count_simd_mt(buf, n, nthreads, &a, &c, &g, &t);
+    count_simd_mt(buf, n, THREADS, &a, &c, &g, &t);
     t1 = now_sec();
+
     printf("SIMD + MT time: %.3f sec\n", t1 - t0);
 
     free(buf);
